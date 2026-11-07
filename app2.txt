@@ -3,6 +3,10 @@ MGF 637 - Project 2: Valuation Dashboard (DCF, Comps, Sensitivity)
 Run:  streamlit run app.py
 Install: pip install streamlit yfinance pandas plotly numpy
 """
+
+streamlit
+plotly
+
 import json
 import os
 
