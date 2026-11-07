@@ -1,0 +1,553 @@
+"""
+MGF 637 - Project 2: Valuation Dashboard (DCF, Comps, Sensitivity)
+Run:  streamlit run app.py
+Install: pip install streamlit yfinance pandas plotly numpy
+"""
+import json
+import os
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+
+st.set_page_config(page_title="Valuation Dashboard", layout="wide")
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+def pick(df, *labels, default=np.nan):
+    """Return the first matching column label, else a default."""
+    for label in labels:
+        if label in df.columns:
+            return df[label]
+    return default
+
+
+def col(df, *labels):
+    """pick() but always returns a Series (NaN-filled if nothing matched)."""
+    r = pick(df, *labels)
+    if isinstance(r, pd.Series):
+        return r
+    return pd.Series(np.nan, index=df.index)
+
+
+def last(series):
+    s = series.dropna()
+    return float(s.iloc[-1]) if len(s) else np.nan
+
+
+def num(x, default=np.nan):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def money(x, d=2):
+    return "N/A" if not np.isfinite(num(x)) else f"${x:,.{d}f}"
+
+
+def big(x):
+    x = num(x)
+    if not np.isfinite(x):
+        return "N/A"
+    for unit, div in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
+        if abs(x) >= div:
+            return f"${x / div:,.2f}{unit}"
+    return f"${x:,.0f}"
+
+
+def pct(x, d=1):
+    return "N/A" if not np.isfinite(num(x)) else f"{x * 100:.{d}f}%"
+
+
+# ----------------------------------------------------------------------
+# Data loading (with CSV / JSON fallback)
+# ----------------------------------------------------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_ticker(ticker, force_cache=False):
+    """Returns (income, balance, cashflow, info, source_message)."""
+    paths = {k: f"{CACHE_DIR}/{ticker}_{k}.csv" for k in ("income", "balance", "cashflow")}
+    info_path = f"{CACHE_DIR}/{ticker}_info.json"
+
+    def from_cache():
+        frames = {k: pd.read_csv(p, index_col=0, parse_dates=True).sort_index() for k, p in paths.items()}
+        with open(info_path) as f:
+            info = json.load(f)
+        return frames["income"], frames["balance"], frames["cashflow"], info
+
+    if force_cache:
+        try:
+            return (*from_cache(), "Loaded from cached CSV files.")
+        except Exception as e:
+            return None, None, None, {}, f"No cache available for {ticker} ({e})."
+
+    try:
+        stock = yf.Ticker(ticker)
+        inc = stock.income_stmt.T.sort_index()
+        bal = stock.balance_sheet.T.sort_index()
+        cf = stock.cashflow.T.sort_index()
+        info = stock.info or {}
+        if inc.empty or bal.empty or cf.empty:
+            raise ValueError("yfinance returned empty statements")
+        for df, k in ((inc, "income"), (bal, "balance"), (cf, "cashflow")):
+            df.to_csv(paths[k])
+        with open(info_path, "w") as f:
+            json.dump(info, f, default=str)
+        return inc, bal, cf, info, "Live data from yfinance (saved to cache)."
+    except Exception as e:
+        try:
+            return (*from_cache(), f"yfinance failed ({e}); using cached CSV.")
+        except Exception:
+            return None, None, None, {}, f"yfinance failed ({e}) and no cache exists."
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_peer(ticker):
+    try:
+        return yf.Ticker(ticker).info or {}
+    except Exception:
+        return {}
+
+
+# ----------------------------------------------------------------------
+# Valuation math
+# ----------------------------------------------------------------------
+def dcf(base_fcf, growth, term_g, wacc, years, cash, debt, shares):
+    """Returns dict; value is NaN if g >= r."""
+    if term_g >= wacc or not np.isfinite(base_fcf):
+        return dict(intrinsic=np.nan, enterprise=np.nan, tv_pct=np.nan, pv=None, projected=None)
+    t = np.arange(1, years + 1)
+    projected = base_fcf * (1 + growth) ** t
+    pv = projected / (1 + wacc) ** t
+    terminal = projected[-1] * (1 + term_g) / (wacc - term_g)
+    pv_terminal = terminal / (1 + wacc) ** years
+    enterprise = pv.sum() + pv_terminal
+    equity = enterprise + cash - debt
+    return dict(
+        intrinsic=equity / shares if shares else np.nan,
+        enterprise=enterprise,
+        equity=equity,
+        tv_pct=pv_terminal / enterprise if enterprise else np.nan,
+        pv=pv,
+        projected=projected,
+        pv_terminal=pv_terminal,
+    )
+
+
+def reverse_dcf(price, base_fcf, term_g, wacc, years, cash, debt, shares):
+    """Bisection: forecast growth that makes intrinsic == market price."""
+    lo, hi = -0.30, 0.60
+    f = lambda g: dcf(base_fcf, g, term_g, wacc, years, cash, debt, shares)["intrinsic"] - price
+    flo, fhi = f(lo), f(hi)
+    if not (np.isfinite(flo) and np.isfinite(fhi)) or flo * fhi > 0:
+        return np.nan
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if f(lo) * f(mid) <= 0:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+# ----------------------------------------------------------------------
+# Sidebar: ticker + data source
+# ----------------------------------------------------------------------
+st.title("Valuation Dashboard: DCF, Comps & Sensitivity")
+
+st.sidebar.header("Company")
+ticker = st.sidebar.text_input("Ticker", "CMCSA").strip().upper()
+force_cache = st.sidebar.checkbox("Use cached CSV (skip yfinance)", value=False)
+if st.sidebar.button("Refresh data"):
+    st.cache_data.clear()
+
+income, balance, cashflow, info, source_msg = load_ticker(ticker, force_cache)
+if income is None:
+    st.error(source_msg)
+    st.stop()
+st.caption(f"Data source: {source_msg}")
+
+# ----------------------------------------------------------------------
+# Part 1: Fundamentals & FCF
+# ----------------------------------------------------------------------
+revenue = col(income, "Total Revenue", "Operating Revenue")
+net_income = col(income, "Net Income", "Net Income Common Stockholders")
+ebitda_s = col(income, "EBITDA", "Normalized EBITDA")
+ocf = col(cashflow, "Operating Cash Flow", "Cash Flow From Continuing Operating Activities")
+capex = col(cashflow, "Capital Expenditure", "Capital Expenditures")
+fcf = (ocf - capex.abs()).reindex(ocf.index)
+if fcf.isna().all():
+    fcf = col(cashflow, "Free Cash Flow")
+
+cur_assets = col(balance, "Current Assets", "Total Current Assets")
+cur_liab = col(balance, "Current Liabilities", "Total Current Liabilities")
+total_debt_s = col(balance, "Total Debt")
+equity_s = col(balance, "Stockholders Equity", "Total Equity Gross Minority Interest", "Common Stock Equity")
+cash_s = col(balance, "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents")
+
+fund = pd.DataFrame({
+    "Revenue": revenue,
+    "Net Income": net_income,
+    "Free Cash Flow": fcf,
+}).tail(4)
+fund["Net Margin"] = fund["Net Income"] / fund["Revenue"]
+fund["FCF Margin"] = fund["Free Cash Flow"] / fund["Revenue"]
+bal4 = pd.DataFrame({
+    "Current Ratio": cur_assets / cur_liab,
+    "Debt/Equity": total_debt_s / equity_s,
+}).tail(4)
+fund = fund.join(bal4, how="left")
+fund.index = [pd.Timestamp(i).year if not isinstance(i, str) else i for i in fund.index]
+
+name = info.get("shortName") or info.get("longName") or ticker
+st.header(f"{name} ({ticker})")
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["1. Fundamentals", "2. DCF", "3. Comps", "4. Sensitivity", "5. Extensions"]
+)
+
+with tab1:
+    st.subheader("Last four years")
+    disp = fund.copy()
+    for c in ("Revenue", "Net Income", "Free Cash Flow"):
+        disp[c] = disp[c].map(big)
+    for c in ("Net Margin", "FCF Margin"):
+        disp[c] = disp[c].map(pct)
+    for c in ("Current Ratio", "Debt/Equity"):
+        disp[c] = disp[c].map(lambda v: "N/A" if not np.isfinite(v) else f"{v:.2f}")
+    st.dataframe(disp, use_container_width=True)
+
+    fig = go.Figure()
+    fig.add_bar(x=fund.index.astype(str), y=fund["Revenue"] / 1e9, name="Revenue")
+    fig.add_bar(x=fund.index.astype(str), y=fund["Net Income"] / 1e9, name="Net Income")
+    fig.add_bar(x=fund.index.astype(str), y=fund["Free Cash Flow"] / 1e9, name="Free Cash Flow")
+    fig.update_layout(title="Revenue, Net Income and FCF ($B)", xaxis_title="Fiscal year",
+                      yaxis_title="$ Billions", barmode="group", legend_title="Metric")
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("FCF = Operating Cash Flow - |CapEx|. Missing labels show as N/A.")
+
+# ----------------------------------------------------------------------
+# Inputs derived from statements / info
+# ----------------------------------------------------------------------
+price = num(info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose"))
+shares = num(info.get("sharesOutstanding"))
+if not np.isfinite(shares):
+    shares = last(col(balance, "Ordinary Shares Number", "Share Issued"))
+cash = last(cash_s)
+debt = last(total_debt_s)
+cash = 0.0 if not np.isfinite(cash) else cash
+debt = 0.0 if not np.isfinite(debt) else debt
+market_cap = num(info.get("marketCap"), price * shares if np.isfinite(price * shares) else np.nan)
+
+fcf_clean = fcf.dropna()
+base_fcf_default = float(fcf_clean.tail(3).mean()) if len(fcf_clean) else np.nan
+
+# Tax rate and cost of debt
+tax_s = col(income, "Tax Rate For Calcs")
+tax_rate = last(tax_s)
+if not np.isfinite(tax_rate) or not (0 <= tax_rate <= 0.5):
+    prov, pre = last(col(income, "Tax Provision")), last(col(income, "Pretax Income"))
+    tax_rate = prov / pre if np.isfinite(prov) and np.isfinite(pre) and pre > 0 else 0.21
+tax_rate = float(np.clip(tax_rate, 0, 0.40))
+int_exp = abs(last(col(income, "Interest Expense")))
+cost_debt = int_exp / debt if debt > 0 and np.isfinite(int_exp) and int_exp > 0 else 0.05
+cost_debt = float(np.clip(cost_debt, 0.01, 0.15))
+
+# ----------------------------------------------------------------------
+# Sidebar: DCF assumptions + scenarios + CAPM
+# ----------------------------------------------------------------------
+st.sidebar.header("DCF Assumptions")
+growth = st.sidebar.slider("Forecast FCF growth (%)", -10.0, 25.0, 0.0, 0.5) / 100
+term_g = st.sidebar.slider("Terminal growth (%)", 0.0, 5.0, 2.0, 0.25) / 100
+years = st.sidebar.slider("Forecast years", 3, 15, 5)
+
+st.sidebar.header("WACC (CAPM)")
+beta_default = num(info.get("beta"), 1.0)
+beta = st.sidebar.number_input("Beta", 0.0, 4.0, float(round(beta_default, 2)), 0.05)
+rf = st.sidebar.number_input("Risk-free rate (%)", 0.0, 10.0, 5.0, 0.1) / 100
+erp = st.sidebar.number_input("Equity risk premium (%)", 0.0, 12.0, 5.0, 0.1) / 100
+cost_debt_in = st.sidebar.number_input("Pre-tax cost of debt (%)", 0.0, 20.0, round(cost_debt * 100, 2), 0.25) / 100
+tax_in = st.sidebar.number_input("Tax rate (%)", 0.0, 50.0, round(tax_rate * 100, 1), 0.5) / 100
+
+re = rf + beta * erp                                    # CAPM cost of equity
+E = market_cap if np.isfinite(market_cap) else 0.0
+D = debt
+wE = E / (E + D) if (E + D) > 0 else 1.0
+wacc_capm = wE * re + (1 - wE) * cost_debt_in * (1 - tax_in)
+adj_bps = st.sidebar.slider("WACC adjustment (bps)", -300, 300, 175, 25)
+wacc = wacc_capm + adj_bps / 10000
+st.sidebar.metric("Cost of equity (CAPM)", pct(re, 2))
+st.sidebar.metric("CAPM WACC (baseline)", pct(wacc_capm, 2))
+st.sidebar.metric("WACC used", pct(wacc, 2))
+
+base_fcf = st.sidebar.number_input(
+    "Base FCF ($M, 3-yr avg default)",
+    value=float(round(base_fcf_default / 1e6, 1)) if np.isfinite(base_fcf_default) else 0.0,
+    step=100.0,
+) * 1e6
+
+# ----------------------------------------------------------------------
+# Part 2: DCF
+# ----------------------------------------------------------------------
+res = None
+with tab2:
+    st.subheader("Discounted Cash Flow")
+    if term_g >= wacc:
+        st.error(f"Terminal growth ({pct(term_g, 2)}) must be below WACC ({pct(wacc, 2)}). "
+                 "Lower terminal growth or raise WACC.")
+    elif not np.isfinite(shares) or shares <= 0:
+        st.error("Shares outstanding unavailable; cannot compute per-share value.")
+    elif not np.isfinite(base_fcf) or base_fcf <= 0:
+        st.warning("Base FCF is missing or non-positive; a DCF on it is not meaningful. "
+                   "Enter a base FCF manually in the sidebar.")
+    else:
+        res = dcf(base_fcf, growth, term_g, wacc, years, cash, debt, shares)
+        upside = res["intrinsic"] / price - 1 if np.isfinite(price) else np.nan
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Intrinsic value / share", money(res["intrinsic"]))
+        c2.metric("Market price", money(price))
+        c3.metric("Implied upside / downside", pct(upside))
+        c4.metric("Terminal value % of EV", pct(res["tv_pct"]))
+
+        st.write(f"**Bridge:** Enterprise {big(res['enterprise'])} + Cash {big(cash)} - Debt {big(debt)} "
+                 f"= Equity {big(res['equity'])}; / {shares / 1e9:,.3f}B shares.")
+        st.write(f"**WACC build:** Re = {pct(rf, 2)} + {beta:.2f} x {pct(erp, 2)} = {pct(re, 2)}; "
+                 f"after-tax Rd = {pct(cost_debt_in * (1 - tax_in), 2)}; "
+                 f"E weight {pct(wE)} / D weight {pct(1 - wE)}; WACC = {pct(wacc_capm, 2)} "
+                 f"(+{adj_bps} bps adj. = {pct(wacc, 2)}).")
+        if res["tv_pct"] > 0.85:
+            st.info("Terminal value dominates (>85% of EV): the answer rests almost entirely on the far future.")
+
+        t = np.arange(1, years + 1)
+        proj = pd.DataFrame({
+            "Year": t,
+            "Projected FCF": res["projected"],
+            "Discount factor": 1 / (1 + wacc) ** t,
+            "PV of FCF": res["pv"],
+        })
+        fig = go.Figure()
+        fig.add_bar(x=proj["Year"], y=proj["Projected FCF"] / 1e9, name="Projected FCF")
+        fig.add_bar(x=proj["Year"], y=proj["PV of FCF"] / 1e9, name="PV of FCF")
+        fig.update_layout(title="Projected vs discounted FCF ($B)", xaxis_title="Forecast year",
+                          yaxis_title="$ Billions", barmode="group", legend_title="Series")
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(proj.style.format({"Projected FCF": "${:,.0f}", "Discount factor": "{:.4f}",
+                                        "PV of FCF": "${:,.0f}"}), use_container_width=True)
+
+# ----------------------------------------------------------------------
+# Part 3: Comps
+# ----------------------------------------------------------------------
+MULT_KEYS = {
+    "P/E": "trailingPE",
+    "EV/EBITDA": "enterpriseToEbitda",
+    "P/S": "priceToSalesTrailing12Months",
+    "P/B": "priceToBook",
+}
+comps_values = {}  # implied per-share values per multiple (median)
+comps_ranges = {}  # (min, max) implied per share, for football field
+
+with tab3:
+    st.subheader("Comparable Company Analysis")
+    peers_txt = st.text_input("Peer tickers (comma-separated)", "CHTR, T, VZ, TMUS")
+    peers = [p.strip().upper() for p in peers_txt.split(",") if p.strip() and p.strip().upper() != ticker]
+
+    rows = {}
+    for p in peers:
+        pi = load_peer(p)
+        rows[p] = {m: num(pi.get(k)) for m, k in MULT_KEYS.items()}
+    mult_df = pd.DataFrame(rows).T if rows else pd.DataFrame(columns=list(MULT_KEYS))
+    # drop non-positive multiples (negative earnings, etc.)
+    mult_clean = mult_df.where(mult_df > 0)
+
+    if mult_clean.dropna(how="all").empty:
+        st.warning("No usable peer multiples. Check the peer tickers.")
+    else:
+        median = mult_clean.median()
+        mine = {m: num(info.get(k)) for m, k in MULT_KEYS.items()}
+        table = mult_clean.copy()
+        table.loc["MEDIAN"] = median
+        table.loc[f"{ticker} (actual)"] = pd.Series(mine)
+
+        def hl(row):
+            return ["background-color: #ffe08a; font-weight: bold; color: #000"] * len(row) \
+                if row.name == "MEDIAN" else [""] * len(row)
+
+        st.dataframe(table.style.apply(hl, axis=1).format("{:.2f}", na_rep="N/A"), use_container_width=True)
+        st.caption("Non-positive multiples are excluded. The median is used so one outlier peer cannot swing the answer.")
+
+        # Our company's metrics
+        eps = num(info.get("trailingEps"))
+        ebitda = num(info.get("ebitda"), last(ebitda_s))
+        sales = num(info.get("totalRevenue"), last(revenue))
+        bvps = num(info.get("bookValue"))
+        sps = sales / shares if np.isfinite(sales) and np.isfinite(shares) and shares > 0 else np.nan
+
+        def implied(m, mult):
+            if m == "P/E":
+                return mult * eps
+            if m == "EV/EBITDA":
+                return (mult * ebitda + cash - debt) / shares
+            if m == "P/S":
+                return mult * sps
+            if m == "P/B":
+                return mult * bvps
+            return np.nan
+
+        out = []
+        for m in MULT_KEYS:
+            col_vals = mult_clean[m].dropna()
+            if col_vals.empty:
+                out.append((m, np.nan, np.nan, np.nan, np.nan))
+                continue
+            v_med = implied(m, median[m])
+            v_lo, v_hi = implied(m, col_vals.min()), implied(m, col_vals.max())
+            comps_values[m] = v_med
+            comps_ranges[m] = (v_lo, v_hi)
+            out.append((m, median[m], v_med, v_lo, v_hi))
+        imp = pd.DataFrame(out, columns=["Multiple", "Peer median", "Implied value / share", "Low (min peer)", "High (max peer)"]).set_index("Multiple")
+        st.write("**Implied value per share (median multiple x your company's metric)**")
+        st.dataframe(imp.style.format({"Peer median": "{:.2f}", "Implied value / share": "${:,.2f}",
+                                       "Low (min peer)": "${:,.2f}", "High (max peer)": "${:,.2f}"}, na_rep="N/A"),
+                     use_container_width=True)
+
+    valid = [v for v in comps_values.values() if np.isfinite(v)]
+    comps_avg = float(np.mean(valid)) if valid else np.nan
+    st.subheader("Side by side")
+    dcf_val = res["intrinsic"] if res else np.nan
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Comps-implied (avg of multiples)", money(comps_avg))
+    c2.metric("DCF intrinsic value", money(dcf_val))
+    c3.metric("Market price", money(price))
+    fig = go.Figure(go.Bar(x=["Comps-implied", "DCF intrinsic", "Market price"],
+                           y=[comps_avg, dcf_val, price],
+                           marker_color=["#4c78a8", "#59a14f", "#e15759"],
+                           text=[money(comps_avg), money(dcf_val), money(price)], textposition="outside"))
+    fig.update_layout(title="Comps vs DCF vs market ($ per share)", xaxis_title="Method",
+                      yaxis_title="$ per share", showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("**Why do they differ?** (write your group's discussion here)")
+    st.text_area("Discussion", "Consider: growth/margin differences vs. peers, whether peers are truly comparable, "
+                 "DCF sensitivity to WACC and terminal growth, and market sentiment embedded in current multiples.",
+                 height=120, label_visibility="collapsed")
+
+# ----------------------------------------------------------------------
+# Part 4: Sensitivity
+# ----------------------------------------------------------------------
+def heatmap(z, xs, ys, xtitle, ytitle, title, price_ref):
+    zt = np.array(z, dtype=float)
+    text = [[("N/A" if not np.isfinite(v) else f"${v:,.0f}") for v in row] for row in zt]
+    fig = go.Figure(go.Heatmap(
+        z=zt, x=[f"{x:.2%}" for x in xs], y=[f"{y:.2%}" for y in ys],
+        text=text, texttemplate="%{text}", colorscale="RdYlGn",
+        zmid=price_ref if np.isfinite(price_ref) else None,
+        colorbar=dict(title="$ / share"),
+    ))
+    ci, cj = len(ys) // 2, len(xs) // 2
+    fig.add_shape(type="rect", x0=cj - 0.5, x1=cj + 0.5, y0=ci - 0.5, y1=ci + 0.5,
+                  line=dict(color="black", width=4))
+    fig.update_layout(title=title, xaxis_title=xtitle, yaxis_title=ytitle, yaxis_autorange="reversed")
+    return fig
+
+
+sens_vals = None
+with tab4:
+    st.subheader("Sensitivity Analysis")
+    if res is None:
+        st.warning("Fix the DCF inputs on the DCF tab first.")
+    else:
+        w_steps = np.array([-0.02, -0.01, 0, 0.01, 0.02])
+        tg_steps = np.array([-0.01, -0.005, 0, 0.005, 0.01])
+        g_steps = np.array([-0.04, -0.02, 0, 0.02, 0.04])
+        waccs = wacc + w_steps
+        tgs = term_g + tg_steps
+        gs = growth + g_steps
+
+        grid = [[dcf(base_fcf, growth, tg, w, years, cash, debt, shares)["intrinsic"] for tg in tgs] for w in waccs]
+        sens_vals = np.array(grid, dtype=float)
+        st.plotly_chart(heatmap(grid, tgs, waccs, "Terminal growth", "WACC",
+                                "Intrinsic value per share: WACC x terminal growth (black box = base case; "
+                                f"green above ${price:,.0f} market price)", price),
+                        use_container_width=True)
+        st.caption("Cells where terminal growth >= WACC are N/A.")
+
+        grid2 = [[dcf(base_fcf, g, term_g, w, years, cash, debt, shares)["intrinsic"] for g in gs] for w in waccs]
+        st.plotly_chart(heatmap(grid2, gs, waccs, "Forecast growth", "WACC",
+                                "Intrinsic value per share: WACC x forecast growth (black box = base case)", price),
+                        use_container_width=True)
+
+        # Which assumption matters most?
+        base_v = res["intrinsic"]
+        moves = {
+            "WACC (+/-1 pt)": (dcf(base_fcf, growth, term_g, wacc + 0.01, years, cash, debt, shares)["intrinsic"],
+                               dcf(base_fcf, growth, term_g, wacc - 0.01, years, cash, debt, shares)["intrinsic"]),
+            "Terminal growth (+/-0.5 pt)": (dcf(base_fcf, growth, term_g + 0.005, wacc, years, cash, debt, shares)["intrinsic"],
+                                            dcf(base_fcf, growth, term_g - 0.005, wacc, years, cash, debt, shares)["intrinsic"]),
+            "Forecast growth (+/-2 pt)": (dcf(base_fcf, growth + 0.02, term_g, wacc, years, cash, debt, shares)["intrinsic"],
+                                          dcf(base_fcf, growth - 0.02, term_g, wacc, years, cash, debt, shares)["intrinsic"]),
+        }
+        swing = pd.DataFrame(
+            {k: {"Low": min(v), "High": max(v), "Swing ($)": abs(v[0] - v[1]),
+                 "Swing (% of base)": abs(v[0] - v[1]) / base_v if base_v else np.nan}
+             for k, v in moves.items()}).T
+        st.write("**Which single assumption moves the valuation most?**")
+        st.dataframe(swing.style.format({"Low": "${:,.2f}", "High": "${:,.2f}", "Swing ($)": "${:,.2f}",
+                                         "Swing (% of base)": "{:.1%}"}, na_rep="N/A"), use_container_width=True)
+        top = swing["Swing ($)"].astype(float).idxmax()
+        st.success(f"Largest swing: **{top}**.")
+        if np.isfinite(price):
+            valid = sens_vals[np.isfinite(sens_vals)]
+            share_cheap = (valid > price).mean()
+            st.write(f"Across the WACC x terminal growth grid, intrinsic value exceeds the market price in "
+                     f"**{share_cheap:.0%}** of cells (stock looks cheap there) and falls below it in "
+                     f"**{1 - share_cheap:.0%}** (looks expensive). Grid range: "
+                     f"{money(valid.min())} to {money(valid.max())} vs price {money(price)}.")
+
+# ----------------------------------------------------------------------
+# Part 5: Extensions
+# ----------------------------------------------------------------------
+with tab5:
+    st.subheader("Football field")
+    bars = []
+    if sens_vals is not None and np.isfinite(sens_vals).any():
+        bars.append(("DCF (sensitivity range)", np.nanmin(sens_vals), np.nanmax(sens_vals)))
+    for m, (lo, hi) in comps_ranges.items():
+        if np.isfinite(lo) and np.isfinite(hi):
+            bars.append((f"Comps: {m}", min(lo, hi), max(lo, hi)))
+    lo52, hi52 = num(info.get("fiftyTwoWeekLow")), num(info.get("fiftyTwoWeekHigh"))
+    if np.isfinite(lo52) and np.isfinite(hi52):
+        bars.append(("52-week range", lo52, hi52))
+    if bars:
+        fig = go.Figure()
+        for label, lo, hi in bars:
+            fig.add_bar(y=[label], x=[hi - lo], base=[lo], orientation="h", name=label,
+                        text=[f"${lo:,.0f} - ${hi:,.0f}"], textposition="inside", showlegend=False)
+        if np.isfinite(price):
+            fig.add_vline(x=price, line_dash="dash", line_color="black",
+                          annotation_text=f"Price ${price:,.2f}")
+        fig.update_layout(title="Valuation range summary ($ per share)", xaxis_title="$ per share",
+                          yaxis_title="Method", yaxis_autorange="reversed")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Not enough data for a football field yet.")
+
+    st.subheader("Reverse DCF")
+    if np.isfinite(price) and np.isfinite(base_fcf) and base_fcf > 0 and term_g < wacc:
+        g_imp = reverse_dcf(price, base_fcf, term_g, wacc, years, cash, debt, shares)
+        if np.isfinite(g_imp):
+            hist = fcf_clean.pct_change().dropna()
+            hist_txt = f" Historical FCF growth in the data averaged {hist.mean():.1%}." if len(hist) else ""
+            st.metric(f"FCF growth implied by ${price:,.2f} over {years} years", pct(g_imp))
+            st.write(f"At WACC {pct(wacc, 2)} and terminal growth {pct(term_g, 2)}, the market price requires "
+                     f"{pct(g_imp)} annual FCF growth.{hist_txt} Judge whether that is believable.")
+        else:
+            st.warning("No growth rate between -30% and 60% reproduces the market price.")
+    else:
+        st.info("Reverse DCF needs a valid price, positive base FCF and terminal growth below WACC.")
+
